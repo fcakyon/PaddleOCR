@@ -96,7 +96,7 @@ class BaseRecLabelEncode(object):
             'ch', 'en', 'EN_symbol', 'french', 'german', 'japan', 'korean',
             'EN', 'it', 'xi', 'pu', 'ru', 'ar', 'ta', 'ug', 'fa', 'ur', 'rs',
             'oc', 'rsc', 'bg', 'uk', 'be', 'te', 'ka', 'chinese_cht', 'hi',
-            'mr', 'ne'
+            'mr', 'ne', 'latin', 'arabic', 'cyrillic', 'devanagari'
         ]
         assert character_type in support_character_type, "Only {} are supported now but get {}".format(
             support_character_type, character_type)
@@ -187,6 +187,78 @@ class CTCLabelEncode(BaseRecLabelEncode):
         return dict_character
 
 
+class E2ELabelEncodeTest(BaseRecLabelEncode):
+    def __init__(self,
+                 max_text_length,
+                 character_dict_path=None,
+                 character_type='EN',
+                 use_space_char=False,
+                 **kwargs):
+        super(E2ELabelEncodeTest,
+              self).__init__(max_text_length, character_dict_path,
+                             character_type, use_space_char)
+
+    def __call__(self, data):
+        import json
+        padnum = len(self.dict)
+        label = data['label']
+        label = json.loads(label)
+        nBox = len(label)
+        boxes, txts, txt_tags = [], [], []
+        for bno in range(0, nBox):
+            box = label[bno]['points']
+            txt = label[bno]['transcription']
+            boxes.append(box)
+            txts.append(txt)
+            if txt in ['*', '###']:
+                txt_tags.append(True)
+            else:
+                txt_tags.append(False)
+        boxes = np.array(boxes, dtype=np.float32)
+        txt_tags = np.array(txt_tags, dtype=np.bool)
+        data['polys'] = boxes
+        data['ignore_tags'] = txt_tags
+        temp_texts = []
+        for text in txts:
+            text = text.lower()
+            text = self.encode(text)
+            if text is None:
+                return None
+            text = text + [padnum] * (self.max_text_len - len(text)
+                                      )  # use 36 to pad
+            temp_texts.append(text)
+        data['texts'] = np.array(temp_texts)
+        return data
+
+
+class E2ELabelEncodeTrain(object):
+    def __init__(self, **kwargs):
+        pass
+
+    def __call__(self, data):
+        import json
+        label = data['label']
+        label = json.loads(label)
+        nBox = len(label)
+        boxes, txts, txt_tags = [], [], []
+        for bno in range(0, nBox):
+            box = label[bno]['points']
+            txt = label[bno]['transcription']
+            boxes.append(box)
+            txts.append(txt)
+            if txt in ['*', '###']:
+                txt_tags.append(True)
+            else:
+                txt_tags.append(False)
+        boxes = np.array(boxes, dtype=np.float32)
+        txt_tags = np.array(txt_tags, dtype=np.bool)
+
+        data['polys'] = boxes
+        data['texts'] = txts
+        data['ignore_tags'] = txt_tags
+        return data
+
+
 class AttnLabelEncode(BaseRecLabelEncode):
     """ Convert between text-label and text-index """
 
@@ -199,16 +271,30 @@ class AttnLabelEncode(BaseRecLabelEncode):
         super(AttnLabelEncode,
               self).__init__(max_text_length, character_dict_path,
                              character_type, use_space_char)
-        self.beg_str = "sos"
-        self.end_str = "eos"
 
     def add_special_char(self, dict_character):
-        dict_character = [self.beg_str, self.end_str] + dict_character
+        self.beg_str = "sos"
+        self.end_str = "eos"
+        dict_character = [self.beg_str] + dict_character + [self.end_str]
         return dict_character
 
-    def __call__(self, text):
+    def __call__(self, data):
+        text = data['label']
         text = self.encode(text)
-        return text
+        if text is None:
+            return None
+        if len(text) >= self.max_text_len:
+            return None
+        data['length'] = np.array(len(text))
+        text = [0] + text + [len(self.character) - 1] + [0] * (self.max_text_len
+                                                               - len(text) - 2)
+        data['label'] = np.array(text)
+        return data
+
+    def get_ignored_tokens(self):
+        beg_idx = self.get_beg_end_flag_idx("beg")
+        end_idx = self.get_beg_end_flag_idx("end")
+        return [beg_idx, end_idx]
 
     def get_beg_end_flag_idx(self, beg_or_end):
         if beg_or_end == "beg":
@@ -241,13 +327,13 @@ class SRNLabelEncode(BaseRecLabelEncode):
     def __call__(self, data):
         text = data['label']
         text = self.encode(text)
-        char_num = len(self.character_str)
+        char_num = len(self.character)
         if text is None:
             return None
         if len(text) > self.max_text_len:
             return None
         data['length'] = np.array(len(text))
-        text = text + [char_num] * (self.max_text_len - len(text))
+        text = text + [char_num - 1] * (self.max_text_len - len(text))
         data['label'] = np.array(text)
         return data
 

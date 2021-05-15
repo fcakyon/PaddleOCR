@@ -18,6 +18,7 @@ from __future__ import print_function
 
 import os
 import sys
+import platform
 import yaml
 import time
 import shutil
@@ -159,10 +160,17 @@ def train(config,
     eval_batch_step = config['Global']['eval_batch_step']
 
     global_step = 0
+    if 'global_step' in pre_best_model_dict:
+        global_step = pre_best_model_dict['global_step']
     start_eval_step = 0
     if type(eval_batch_step) == list and len(eval_batch_step) >= 2:
         start_eval_step = eval_batch_step[0]
         eval_batch_step = eval_batch_step[1]
+        if len(valid_dataloader) == 0:
+            logger.info(
+                'No Images in eval dataset, evaluation during training will be disabled'
+            )
+            start_eval_step = 1e111
         logger.info(
             "During the training process, after the {}th iteration, an evaluation is run every {} iterations".
             format(start_eval_step, eval_batch_step))
@@ -177,6 +185,8 @@ def train(config,
     model_average = False
     model.train()
 
+    use_srn = config['Architecture']['algorithm'] == "SRN"
+
     if 'start_epoch' in best_model_dict:
         start_epoch = best_model_dict['start_epoch']
     else:
@@ -189,13 +199,15 @@ def train(config,
         train_reader_cost = 0.0
         batch_sum = 0
         batch_start = time.time()
+        max_iter = len(train_dataloader) - 1 if platform.system(
+        ) == "Windows" else len(train_dataloader)
         for idx, batch in enumerate(train_dataloader):
             train_reader_cost += time.time() - batch_start
-            if idx >= len(train_dataloader):
+            if idx >= max_iter:
                 break
             lr = optimizer.get_lr()
             images = batch[0]
-            if config['Architecture']['algorithm'] == "SRN":
+            if use_srn:
                 others = batch[-4:]
                 preds = model(images, others)
                 model_average = True
@@ -222,16 +234,17 @@ def train(config,
                 batch = [item.numpy() for item in batch]
                 post_result = post_process_class(preds, batch[1])
                 eval_class(post_result, batch)
-                metirc = eval_class.get_metric()
-                train_stats.update(metirc)
+                metric = eval_class.get_metric()
+                train_stats.update(metric)
 
             if vdl_writer is not None and dist.get_rank() == 0:
                 for k, v in train_stats.get().items():
                     vdl_writer.add_scalar('TRAIN/{}'.format(k), v, global_step)
                 vdl_writer.add_scalar('TRAIN/lr', lr, global_step)
 
-            if dist.get_rank(
-            ) == 0 and global_step > 0 and global_step % print_batch_step == 0:
+            if dist.get_rank() == 0 and (
+                (global_step > 0 and global_step % print_batch_step == 0) or
+                (idx >= len(train_dataloader) - 1)):
                 logs = train_stats.log()
                 strs = 'epoch: [{}/{}], iter: {}, {}, reader_cost: {:.5f} s, batch_cost: {:.5f} s, samples: {}, ips: {:.5f}'.format(
                     epoch, epoch_num, global_step, logs, train_reader_cost /
@@ -251,8 +264,12 @@ def train(config,
                         min_average_window=10000,
                         max_average_window=15625)
                     Model_Average.apply()
-                cur_metirc = eval(model, valid_dataloader, post_process_class,
-                                  eval_class)
+                cur_metric = eval(
+                    model,
+                    valid_dataloader,
+                    post_process_class,
+                    eval_class,
+                    use_srn=use_srn)
                 cur_metric_str = 'cur metric, {}'.format(', '.join(
                     ['{}: {}'.format(k, v) for k, v in cur_metric.items()]))
                 logger.info(cur_metric_str)
@@ -275,7 +292,8 @@ def train(config,
                         is_best=True,
                         prefix='best_accuracy',
                         best_model_dict=best_model_dict,
-                        epoch=epoch)
+                        epoch=epoch,
+                        global_step=global_step)
                 best_str = 'best metric, {}'.format(', '.join([
                     '{}: {}'.format(k, v) for k, v in best_model_dict.items()
                 ]))
@@ -297,7 +315,8 @@ def train(config,
                 is_best=False,
                 prefix='latest',
                 best_model_dict=best_model_dict,
-                epoch=epoch)
+                epoch=epoch,
+                global_step=global_step)
         if dist.get_rank() == 0 and epoch > 0 and epoch % save_epoch_step == 0:
             save_model(
                 model,
@@ -307,7 +326,8 @@ def train(config,
                 is_best=False,
                 prefix='iter_epoch_{}'.format(epoch),
                 best_model_dict=best_model_dict,
-                epoch=epoch)
+                epoch=epoch,
+                global_step=global_step)
     best_str = 'best metric, {}'.format(', '.join(
         ['{}: {}'.format(k, v) for k, v in best_model_dict.items()]))
     logger.info(best_str)
@@ -316,19 +336,26 @@ def train(config,
     return
 
 
-def eval(model, valid_dataloader, post_process_class, eval_class):
+def eval(model, valid_dataloader, post_process_class, eval_class,
+         use_srn=False):
     model.eval()
     with paddle.no_grad():
         total_frame = 0.0
         total_time = 0.0
         pbar = tqdm(total=len(valid_dataloader), desc='eval model:')
+        max_iter = len(valid_dataloader) - 1 if platform.system(
+        ) == "Windows" else len(valid_dataloader)
         for idx, batch in enumerate(valid_dataloader):
-            if idx >= len(valid_dataloader):
+            if idx >= max_iter:
                 break
             images = batch[0]
-            others = batch[-4:]
             start = time.time()
-            preds = model(images, others)
+
+            if use_srn:
+                others = batch[-4:]
+                preds = model(images, others)
+            else:
+                preds = model(images)
 
             batch = [item.numpy() for item in batch]
             # Obtain usable results from post-processing methods
@@ -358,7 +385,8 @@ def preprocess(is_train=False):
 
     alg = config['Architecture']['algorithm']
     assert alg in [
-        'EAST', 'DB', 'SAST', 'Rosetta', 'CRNN', 'STARNet', 'RARE', 'SRN', 'CLS'
+        'EAST', 'DB', 'SAST', 'Rosetta', 'CRNN', 'STARNet', 'RARE', 'SRN',
+        'CLS', 'PGNet'
     ]
 
     device = 'gpu:{}'.format(dist.ParallelEnv().dev_id) if use_gpu else 'cpu'
@@ -378,6 +406,7 @@ def preprocess(is_train=False):
     logger = get_logger(name='root', log_file=log_file)
     if config['Global']['use_visualdl']:
         from visualdl import LogWriter
+        save_model_dir = config['Global']['save_model_dir']
         vdl_writer_path = '{}/vdl/'.format(save_model_dir)
         os.makedirs(vdl_writer_path, exist_ok=True)
         vdl_writer = LogWriter(logdir=vdl_writer_path)
